@@ -243,6 +243,13 @@ make_tree  = lambda: HistGradientBoostingRegressor(max_iter=300, learning_rate=0
 - **Choose on validation and look at the test once.** Write down the choice and its reason before running the test. On test the ensemble looked best (31.8); picking it then would have meant using 2023 to choose the model.
 - **When the test disagrees with your choice, have the "why not X?" answer ready.** Lasso beat the tree on test (33.3 vs 34.0), but on average they tie, 2023 had no out-of-range days, and I chose the tree for its worst case.
 - **Tune last, and only a little.** When the data keeps changing regime, the training window (3/6/12 months) is the setting worth discussing: a short window adapts to new regimes, a long one includes more rare events. Treat a gain under about 1 EUR as noise and call the model "insensitive to this choice" rather than "better".
+- **Rolling vs expanding window: expect "why 3 months?". Treat it as a validation choice (3m / 12m / expanding = 3 runs) and state the trade-off.**
+  - *For a short rolling window:* regime changes. In 2022 the price per GW of residual load moved with gas prices, so old relationships go stale, especially for a linear model on raw prices.
+  - *For expanding:* more data, more rare events (negative prices, spikes), every season covered (a 3-month window never contains the season it predicts), and trees need the full range because they can't extrapolate.
+  - *Trailing normalisation of the target* (minus the 28-day median, divided by the MAD) already removes much of the level and scale drift, which weakens the case for a short window.
+  - *Evidence (drill frame, raw price target, MAE):* tree 3m 53.0 vs expanding **47.9**, with expanding best in both years. Lasso: 3m best during the 2022 crisis (51.6 vs 53.2), 6m / expanding best in calm 2023 (43.6 / 44.3 vs 45.9), a tie overall. 12m was worst for lasso (it holds exactly the crisis year when predicting 2023).
+  - *Middle ground (mention only):* expanding window with recency weights (`sample_weight` = 0.5^(age / half-life)).
+  - My main notebook used 3m without testing alternatives. Interview line: *"I chose 3 months to adapt to the 2022 regime; the honest check is 3m vs 12m vs expanding on validation. On a simpler version of this setup, expanding helped the tree and was a tie for lasso."*
 
 ### Drivers
 - **There are two kinds of evidence, and they answer different questions.**
@@ -517,7 +524,7 @@ The model is used on the future, so a feature whose distribution drifts forces e
 
 # Code snippets (tested, copy and adapt)
 
-Every block below was run end to end on the mock data (power: `clean/*.csv`, order flow: `mock3_data/*.csv`). Usage lines show the power example; change the column names to fit the new data. **After pasting, still check the printed counts.**
+Short, plain versions of everything I practised. All blocks run in order on the mock data (power: `clean/*.csv`, order flow: `mock3_data/*.csv`). Rename the columns for the new data, and still check the printed counts.
 
 ### S0. Imports
 ```python
@@ -530,290 +537,238 @@ from sklearn.pipeline import make_pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import Lasso, Ridge, LinearRegression
+from sklearn.linear_model import Lasso
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.inspection import permutation_importance, PartialDependenceDisplay
 ```
 
 ### S1. Profile a file (first 30 minutes)
 ```python
-def profile(df, name=''):
-    print(f'== {name}: shape={df.shape}, exact duplicate rows={df.duplicated().sum()}')
-    nulls = df.isna().sum()
-    print(nulls[nulls > 0].to_string() if nulls.any() else 'no nulls')
+def profile(df):
+    print(df.shape, '| duplicate rows:', df.duplicated().sum())
+    print(df.isna().sum()[df.isna().sum() > 0])
     for c in df.select_dtypes('number'):
         s = df[c]
-        print(f'{c:>20}: min={s.min():.6g} (n={int((s == s.min()).sum())})  '
-              f'max={s.max():.6g} (n={int((s == s.max()).sum())})  top={s.value_counts().head(3).to_dict()}')
-    for c in df.select_dtypes(exclude='number'):
-        print(f'{c:>20}: {df[c].nunique()} unique, top={df[c].value_counts().head(5).to_dict()}')
+        print(c, '| min', s.min(), 'x', (s == s.min()).sum(), '| max', s.max(), 'x', (s == s.max()).sum())
+    for c in df.select_dtypes('object'):
+        print(c, df[c].value_counts().head().to_dict())
 
 prices = pd.read_csv('clean/prices.csv', parse_dates=['timestamp'])
 load = pd.read_csv('clean/load.csv', parse_dates=['timestamp'])
 ren = pd.read_csv('clean/renewables_weather.csv', parse_dates=['timestamp'])
-profile(prices, 'prices')
-print(prices.groupby(prices['timestamp'].dt.date).size().value_counts())   # rows per day: expect one value
+profile(prices)
+# rows per day
+print(prices.groupby(prices['timestamp'].dt.date).size().value_counts())
 ```
 
 ### S2. Merge with checks
 ```python
-def merge_checked(left, right, on, how='left', validate='1:1'):
-    out = left.merge(right, on=on, how=how, validate=validate)
-    if how == 'left':
-        assert len(out) == len(left), f'row count changed: {len(left)} -> {len(out)}'
-    new = [c for c in right.columns if c not in on]
-    print(f'rows={len(out)}, rows with no match on the right={out[new].isna().all(axis=1).sum()}')
-    return out
+# placeholders -> NaN before any lag
+prices.loc[prices['price_eur_mwh'] == -9999, 'price_eur_mwh'] = np.nan
 
-prices.loc[prices['price_eur_mwh'] == -9999, 'price_eur_mwh'] = np.nan     # placeholders -> NaN BEFORE any lags
-df = merge_checked(prices[['timestamp', 'price_eur_mwh', 'daily_avg_price']],
-                   load[['timestamp', 'load_forecast_mw']], on=['timestamp'])
-df = merge_checked(df, ren[['timestamp', 'wind_forecast_mw', 'solar_forecast_mw']], on=['timestamp'])
+df = prices[['timestamp', 'price_eur_mwh', 'daily_avg_price']].rename(columns={'price_eur_mwh': 'price'})
+df = df.merge(load[['timestamp', 'load_forecast_mw']], on='timestamp', how='left', validate='1:1')
+df = df.merge(ren[['timestamp', 'wind_forecast_mw', 'solar_forecast_mw']], on='timestamp', how='left', validate='1:1')
+assert len(df) == len(prices)
+print(df.isna().sum())
 ```
 
 ### S3. Value at another time, looked up by time (lags, forward values; safe across gaps)
 ```python
-def value_at_offset(df, col, offset, time_col='timestamp', by=(), name=None):
-    """New column = value of `col` at time t + offset, for the same `by` keys (NaN if that time doesn't exist).
-    offset = -pd.Timedelta(days=1) -> lag of one day;  +pd.Timedelta(minutes=5) -> value 5 minutes ahead."""
-    by = list(by)
-    src = df[by + [time_col, col]].copy()
-    src[time_col] = src[time_col] - offset            # the row stamped t now carries the value from t + offset
-    name = name or f'{col}_at_{offset}'
-    return df.merge(src.rename(columns={col: name}), on=by + [time_col], how='left', validate='1:1')
+def at_offset(df, col, offset, time_col='timestamp', by=()):
+    """Value of col at (time + offset), same `by` keys. NaN if that time doesn't exist."""
+    src = df[[*by, time_col, col]].copy()
+    src[time_col] -= offset
+    out = df[[*by, time_col]].merge(src, on=[*by, time_col], how='left', validate='1:1')
+    return out[col].to_numpy()
 
-df = value_at_offset(df, 'price_eur_mwh', -pd.Timedelta(days=1), name='p_lag1')
-df = value_at_offset(df, 'price_eur_mwh', -pd.Timedelta(days=7), name='p_lag7')
+df['p_lag1'] = at_offset(df, 'price', -pd.Timedelta(days=1))
+df['p_lag7'] = at_offset(df, 'price', -pd.Timedelta(days=7))
 df['date'], df['hour'] = df['timestamp'].dt.normalize(), df['timestamp'].dt.hour
 daily = df.groupby('date')['daily_avg_price'].first()
-df['lvl28'] = df['date'].map(daily.shift(1).rolling(28).median())        # days T-28 .. T-1 only
+# days T-28 .. T-1
+df['lvl28'] = df['date'].map(daily.shift(1).rolling(28).median())
 df['resid_fc'] = df['load_forecast_mw'] - df['wind_forecast_mw'] - df['solar_forecast_mw']
-df = df.rename(columns={'price_eur_mwh': 'price'})
-print(df.loc[(df['date'] == '2022-03-15') & (df['hour'] == 18), ['price', 'p_lag1', 'p_lag7', 'lvl28', 'resid_fc']])
 ```
 
 ### S4. Latest value published at or before t (as-of join), same day only
 ```python
-def asof_join(left, right, left_time, right_time, by, same_day=True):
-    l, r, by = left.sort_values(left_time), right.sort_values(right_time), list(by)
-    if same_day:
-        l = l.assign(_day=l[left_time].dt.normalize())
-        r = r.assign(_day=r[right_time].dt.normalize())
-        by = by + ['_day']
-    out = pd.merge_asof(l, r, left_on=left_time, right_on=right_time, by=by, direction='backward')
-    return out.drop(columns='_day', errors='ignore')
+def asof_same_day(left, right, left_time, right_time, by):
+    left = left.assign(day=left[left_time].dt.normalize()).sort_values(left_time)
+    right = right.assign(day=right[right_time].dt.normalize()).sort_values(right_time)
+    return pd.merge_asof(left, right, left_on=left_time, right_on=right_time, by=[*by, 'day'])
 ```
 
 ### S5. Splits
 ```python
-def monthly_splits(dates, start, end, train_months=None, gap=pd.Timedelta(0)):
-    """dates: Series of dates aligned to the frame. train_months=None -> expanding window.
-    gap: leave out training rows within `gap` of the test start (use the label horizon when labels overlap)."""
-    for m in pd.date_range(start, end, freq='MS'):                      # freq='MS' is essential
-        test = (dates >= m) & (dates < m + pd.DateOffset(months=1))
-        lo = dates.min() if train_months is None else m - pd.DateOffset(months=train_months)
-        train = (dates >= lo) & (dates < m - gap)
+# None = expanding window
+def monthly_splits(df, start, end, train_months=None):
+    for m in pd.date_range(start, end, freq='MS'):
+        test = (df['date'] >= m) & (df['date'] < m + pd.DateOffset(months=1))
+        # overlapping labels: use m - horizon
+        train = df['date'] < m
+        if train_months:
+            train &= df['date'] >= m - pd.DateOffset(months=train_months)
         yield m, train, test
 
-def yearly_splits(df, start, end, label_time, event_year):
-    """Train on rows whose LABEL was known before Jan 1 of year y; test on rows whose event is in year y."""
+# train: label known before Jan 1 of y; test: events in year y
+def yearly_splits(df, start, end):
     for y in range(start, end + 1):
-        yield y, df[label_time] < pd.Timestamp(f'{y}-01-01'), df[event_year] == y
+        yield y, df['sale_date'] < f'{y}-01-01', df['year'] == y
 ```
 
 ### S6. Walk-forward
 ```python
-def walk_forward(df, features, make_model, target, make_splits, keep=(), drop_missing_features=True, return_models=False):
-    """make_model(): returns a fresh, unfitted model.  make_splits(rows): yields (fold, train_mask, test_mask).
-    keep: extra columns carried to the output (baseline, hour, ...). Drops only rows that can't be used."""
-    rows = df.dropna(subset=features + [target]) if drop_missing_features else df.dropna(subset=[target])
-    keep_cols = list(dict.fromkeys([target, *keep]))                   # no duplicate columns
-    out, models = [], {}
-    for fold, tr, te in make_splits(rows):
-        if tr.sum() == 0 or te.sum() == 0:
-            continue
-        model = make_model().fit(rows.loc[tr, features], rows.loc[tr, target])
-        pred = rows.loc[te, keep_cols].copy()
-        pred['pred'] = model.predict(rows.loc[te, features])
-        pred['fold'] = fold
+def walk_forward(df, features, make_model, target, keep=(), **split_kw):
+    # only rows without a target are unusable
+    df = df.dropna(subset=[target])
+    out = []
+    for m, tr, te in monthly_splits(df, **split_kw):
+        model = make_model().fit(df.loc[tr, features], df.loc[tr, target])
+        pred = df.loc[te, [target, *keep]].copy()
+        pred['pred'] = model.predict(df.loc[te, features])
+        pred['fold'] = m
         out.append(pred)
-        models[fold] = model
     res = pd.concat(out)
-    assert res.index.is_unique, 'test folds overlap'
-    print(f"folds={res['fold'].nunique()}, prediction rows={len(res)}")
-    return (res, models) if return_models else res
+    print('folds', res['fold'].nunique(), '| rows', len(res))
+    return res
 
-splits = lambda d: monthly_splits(d['date'], '2022-01-01', '2023-12-01', train_months=3)
+split = dict(start='2022-01-01', end='2023-12-01', train_months=3)
 ```
 
 ### S7. Models
 ```python
-def make_linear(num, cat=(), model=None):
-    """Numeric: median impute (+ missing flags) and scale. Categorical: one-hot. Everything is refitted per fold."""
-    parts = [('num', make_pipeline(SimpleImputer(strategy='median', add_indicator=True), StandardScaler()), list(num))]
-    if len(cat):
-        parts.append(('cat', OneHotEncoder(handle_unknown='ignore'), list(cat)))
-    return make_pipeline(ColumnTransformer(parts), model if model is not None else Ridge(alpha=1.0))
+num = ['p_lag1', 'p_lag7', 'lvl28', 'resid_fc']
+cat = ['hour']
 
-num, cat = ['p_lag1', 'p_lag7', 'lvl28', 'resid_fc'], ['hour']
-features = num + cat
-make_lasso = lambda: make_linear(num, cat, Lasso(alpha=0.1, max_iter=20000))
-make_tree = lambda: HistGradientBoostingRegressor(random_state=0)    # loss='absolute_error' targets the median (MAE)
+def make_lasso(num=num, cat=cat):
+    pre = ColumnTransformer([
+        ('num', make_pipeline(SimpleImputer(strategy='median', add_indicator=True), StandardScaler()), num),
+        ('cat', OneHotEncoder(handle_unknown='ignore'), cat),
+    ])
+    return make_pipeline(pre, Lasso(alpha=0.1, max_iter=20000))
 
-res_l, models_l = walk_forward(df, features, make_lasso, 'price', splits, keep=['p_lag1', 'hour'], return_models=True)
-res_t = walk_forward(df, features, make_tree, 'price', splits)
-assert res_l.index.equals(res_t.index)                               # identical rows
-res = res_l.rename(columns={'pred': 'lasso'}).assign(tree=res_t['pred'])
+# handles NaN itself; loss='absolute_error' targets the median (MAE)
+make_tree = lambda: HistGradientBoostingRegressor(random_state=0)
+
+res = walk_forward(df, num + cat, make_lasso, 'price', keep=['p_lag1', 'hour'], **split)
+res = res.rename(columns={'pred': 'lasso'})
+res['tree'] = walk_forward(df, num + cat, make_tree, 'price', **split)['pred']
 ```
 
 ### S8. Results table and breakdowns (baseline column always alongside)
 ```python
-def scores(res, target, cols, baseline):
-    t = pd.DataFrame({c: {'MAE': (res[c] - res[target]).abs().mean(),
-                          'RMSE': np.sqrt(((res[c] - res[target]) ** 2).mean()),
-                          'bias': (res[c] - res[target]).mean()} for c in cols}).T
-    t['MAE_vs_baseline'] = t['MAE'] / t.loc[baseline, 'MAE']
-    return t.round(3)
-
-def breakdown(res, target, cols, key):
-    """MAE by key: a column name (hour, fold) or a Series aligned to res (e.g. res['price'] < 0)."""
-    k = res[key] if isinstance(key, str) else key
-    err = pd.DataFrame({c: (res[c] - res[target]).abs() for c in cols})
-    return err.groupby(k).mean().assign(n=err.groupby(k).size()).round(2)
-
-cols = ['lasso', 'tree', 'p_lag1']
-print(scores(res, 'price', cols, baseline='p_lag1'))
-print(breakdown(res, 'price', cols, 'hour'))
-print(breakdown(res, 'price', cols, 'fold'))
-print(breakdown(res, 'price', cols, (res['price'] < 0).rename('negative_price')))
-print(res[['lasso', 'tree']].describe().round(1))                     # are the predictions plausible?
+# identical rows for all
+err = res[['lasso', 'tree', 'p_lag1']].sub(res['price'], axis=0).abs().dropna()
+print(pd.DataFrame({'MAE': err.mean(), 'RMSE': np.sqrt((err ** 2).mean())}).round(2))
+print(err.groupby(res['hour']).mean().round(1))
+print(err.groupby(res['fold']).mean().round(1))
+# a condition: negative-price hours
+print(err.groupby(res['price'] < 0).mean().round(1))
+# are the predictions plausible?
+print(res[['lasso', 'tree']].describe().round(1))
 ```
 
 ### S9. Drivers: group ablation, coefficients across folds, permutation importance, partial dependence
 ```python
-def ablation(df, groups, all_features, make_model_for, target, make_splits):
-    """make_model_for(features) -> fresh model. Every run uses the same rows (selected with all_features)."""
-    rows = df.dropna(subset=all_features + [target])
-    out = {}
-    for name, dropped in [('full', [])] + list(groups.items()):
-        feats = [f for f in all_features if f not in dropped]
-        r = walk_forward(rows, feats, lambda: make_model_for(feats), target, make_splits)
-        out['full' if name == 'full' else f'without {name}'] = (r['pred'] - r[target]).abs().mean()
-    return pd.Series(out).round(2)
+groups = {'prices': ['p_lag1', 'p_lag7', 'lvl28'], 'fundamentals': ['resid_fc'], 'calendar': ['hour']}
+for name, dropped in [('full', [])] + list(groups.items()):
+    n = [f for f in num if f not in dropped]
+    c = [f for f in cat if f not in dropped]
+    r = walk_forward(df, n + c, lambda: make_lasso(n, c), 'price', **split)
+    print(name, round((r['pred'] - r['price']).abs().mean(), 2))
 
-lasso_for = lambda feats: make_linear([f for f in feats if f in num], [f for f in feats if f in cat],
-                                      Lasso(alpha=0.1, max_iter=20000))
-print(ablation(df, {'prices': ['p_lag1', 'p_lag7', 'lvl28'], 'fundamentals': ['resid_fc'], 'calendar': ['hour']},
-               features, lasso_for, 'price', splits))
+d = df.dropna(subset=['price'])
+coefs = {}
+for m, tr, te in monthly_splits(d, **split):
+    model = make_lasso().fit(d.loc[tr, num + cat], d.loc[tr, 'price'])
+    coefs[m] = pd.Series(model[-1].coef_, index=model[:-1].get_feature_names_out())
+coefs = pd.DataFrame(coefs).T
+print(pd.DataFrame({'median': coefs.median(), 'share_positive': (coefs > 0).mean()}).round(2)
+      .sort_values('median', key=abs, ascending=False).head(8))
 
-def coef_table(models):
-    c = pd.DataFrame({f: pd.Series(m[-1].coef_, index=m[:-1].get_feature_names_out()) for f, m in models.items()}).T
-    return pd.DataFrame({'median': c.median(), 'share_nonzero': (c != 0).mean(), 'share_positive': (c > 0).mean()}).round(3)
-print(coef_table(models_l).head(8))
-
-last = max(models_l)
-idx = res.index[res['fold'] == last]
-pi = permutation_importance(models_l[last], df.loc[idx, features], df.loc[idx, 'price'],
-                            scoring='neg_mean_absolute_error', n_repeats=5, random_state=0)
-print(pd.Series(pi.importances_mean, index=features).sort_values(ascending=False).round(2))
-PartialDependenceDisplay.from_estimator(models_l[last], df.loc[idx, features], ['resid_fc', 'p_lag1'])
+# last fold's test month
+X_last, y_last = d.loc[te, num + cat], d.loc[te, 'price']
+pi = permutation_importance(model, X_last, y_last, scoring='neg_mean_absolute_error', n_repeats=5, random_state=0)
+print(pd.Series(pi.importances_mean, index=num + cat).sort_values(ascending=False).round(2))
+PartialDependenceDisplay.from_estimator(model, X_last.dropna(), ['resid_fc', 'p_lag1'])
 ```
 
 ### S10. Signal checks (low-signal / trading data)
 ```python
-def decile_table(x, y, q=10):
+def decile_table(x, y):
     d = pd.DataFrame({'x': x, 'y': y}).dropna()
-    d['bin'] = pd.qcut(d['x'], q, labels=False, duplicates='drop')
-    return d.groupby('bin').agg(x_mean=('x', 'mean'), y_mean=('y', 'mean'), n=('y', 'size'))
+    return d.groupby(pd.qcut(d['x'], 10, labels=False, duplicates='drop'))['y'].agg(['mean', 'count'])
 
-def daily_corr(df, x, y, date_col='date'):
-    """One correlation per day -> mean, t-stat, share of positive days (handles overlapping labels within a day)."""
-    c = df.dropna(subset=[x, y]).groupby(date_col)[[x, y]].corr().xs(x, level=1)[y]
-    return pd.Series({'mean': c.mean(), 't_stat': c.mean() / c.std() * np.sqrt(c.count()),
-                      'share_positive': (c > 0).mean(), 'days': c.count()}).round(3)
+# one correlation per day: handles overlapping labels within a day
+def daily_corr(df, x, y):
+    c = df.groupby('date')[[x, y]].corr().xs(x, level=1)[y].dropna()
+    return pd.Series({'mean': c.mean(), 't_stat': c.mean() / c.std() * np.sqrt(len(c)), 'share_pos': (c > 0).mean()})
 
-def threshold_pnl(signal, fwd_ret, cost, quantiles=(0.5, 0.8, 0.9, 0.95, 0.99)):
-    """Trade sign(signal) when |signal| is above its quantile. fwd_ret and round-trip cost in the same units.
-    Choose the threshold on training/validation data, not on the test set."""
-    d = pd.DataFrame({'s': signal, 'r': fwd_ret, 'c': cost}).dropna()
-    out = {}
-    for q in quantiles:
-        t = d[d['s'].abs() >= d['s'].abs().quantile(q)]
-        gross = (np.sign(t['s']) * t['r']).mean()
-        out[q] = {'n_trades': len(t), 'gross': gross, 'cost': t['c'].mean(), 'net': gross - t['c'].mean(),
-                  'hit_rate': (np.sign(t['s']) == np.sign(t['r'])).mean()}
-    return pd.DataFrame(out).T.round(3)
+# choose q on training data, not on the test set
+def threshold_pnl(signal, ret, cost, q):
+    trade = signal.abs() >= signal.abs().quantile(q)
+    gross = (np.sign(signal) * ret)[trade].mean()
+    return pd.Series({'trades': trade.sum(), 'gross': gross, 'cost': cost[trade].mean(), 'net': gross - cost[trade].mean()})
 
 bars = pd.read_csv('mock3_data/bars.csv', parse_dates=['ts']).drop_duplicates()
 book = pd.read_csv('mock3_data/book.csv', parse_dates=['minute'])
 vendor = pd.read_csv('mock3_data/vendor_signal.csv', parse_dates=['published_at'])
+
 bars['lmid'] = np.log(bars['mid_close'])
-bars = value_at_offset(bars, 'lmid', pd.Timedelta(minutes=5), time_col='ts', by=['instrument'], name='lmid_fwd5')
-bars['fwd5_bps'] = (bars['lmid_fwd5'] - bars['lmid']) * 1e4
-book['ts'] = book['minute'] + pd.Timedelta(minutes=1)              # align conventions, then CHECK with a shared column
-x = merge_checked(bars, book.drop(columns='minute'), on=['ts', 'instrument'])
-print('mid match rate:', np.isclose((x['bid_px1'] + x['ask_px1']) / 2, x['mid_close']).mean())
+bars['fwd5_bps'] = (at_offset(bars, 'lmid', pd.Timedelta(minutes=5), 'ts', by=['instrument']) - bars['lmid']) * 1e4
+# align, then CHECK with a shared column
+book['ts'] = book['minute'] + pd.Timedelta(minutes=1)
+x = bars.merge(book.drop(columns='minute'), on=['ts', 'instrument'], how='left', validate='1:1')
+print('mid match:', np.isclose((x['bid_px1'] + x['ask_px1']) / 2, x['mid_close']).mean())
 x['bi'] = (x['bid_sz1'] - x['ask_sz1']) / (x['bid_sz1'] + x['ask_sz1'])
-x['date'] = x['ts'].dt.normalize()
-x = asof_join(x, vendor, 'ts', 'published_at', by=['instrument'])
+x = asof_same_day(x, vendor, 'ts', 'published_at', by=['instrument'])
+x['date'] = x['day']
+
 k = x[x['instrument'] == 'KST']
 print(decile_table(k['bi'], k['fwd5_bps']))
 print(daily_corr(k, 'bi', 'fwd5_bps'))
-cost_bps = (k['spread_close'] / k['mid_close']) * 1e4 + 2 * 0.25   # approx: entry spread used for exit too
-print(threshold_pnl(k['bi'], k['fwd5_bps'], cost_bps))
+# round trip, bps (approx.)
+cost = k['spread_close'] / k['mid_close'] * 1e4 + 2 * 0.25
+print(pd.DataFrame({q: threshold_pnl(k['bi'], k['fwd5_bps'], cost, q) for q in [0.5, 0.9, 0.99]}).T.round(2))
 ```
 
 ### S11. Index / composition (cross-sectional "has the level changed?")
 ```python
-def index_vs_raw(data, y, period, controls_formula):
-    """Hedonic index (period dummies + controls) vs raw mean, on the SAME rows; gap = composition effect."""
-    m = smf.ols(f'{y} ~ C({period}) + {controls_formula}', data).fit(cov_type='HC1')
-    used = data.loc[m.model.data.row_labels]
-    periods = sorted(used[period].unique())
-    delta = pd.Series([0.0] + [m.params[f'C({period})[T.{p}]'] for p in periods[1:]], index=periods)
-    raw = used.groupby(period)[y].mean()
-    out = pd.DataFrame({'index_log': delta, 'raw_log': raw - raw.iloc[0]})
-    out['composition'] = out['raw_log'] - out['index_log']          # exact: residuals average 0 within each period
-    return out.round(3)
+data = df.dropna(subset=['price', 'resid_fc']).query('price > 0').assign(lp=lambda t: np.log(t['price']))
+data['year'] = data['date'].dt.year
 
-def plot_index(series, ylabel='first period = 100'):
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for name, s in series.items():                                  # s in log points relative to the first period
-        ax.plot(s.index, 100 * np.exp(s), marker='o', label=name)
-    ax.axhline(100, color='grey', lw=0.8)
-    ax.set_ylabel(ylabel)
-    ax.legend()
-    return ax
+m = smf.ols('lp ~ C(year) + resid_fc + C(hour)', data).fit(cov_type='HC1')
+# same rows for both series
+used = data.loc[m.model.data.row_labels]
+# log change vs the first year, fixed mix
+index = m.params.filter(like='C(year)').to_numpy()
+raw = used.groupby('year')['lp'].mean()
+raw = (raw - raw.iloc[0]).iloc[1:]
+print(pd.DataFrame({'index': index, 'raw': raw, 'composition': raw - index}).round(3))
 
-df['year'] = df['date'].dt.year
-t = index_vs_raw(df.dropna(subset=['price', 'resid_fc']).query('price > 0').assign(lp=lambda d: np.log(d['price'])),
-                 'lp', 'year', 'resid_fc + C(hour)')
-print(t)
-plot_index({'raw mean': t['raw_log'], 'index': t['index_log']})
+plt.plot(raw.index, 100 * np.exp(raw), 'o-', label='raw mean')
+plt.plot(raw.index, 100 * np.exp(index), 's-', label='index (fixed mix)')
+plt.ylabel('first year = 100'); plt.legend()
 ```
 
 ### S12. ACF with gaps (keep the time grid, never `dropna()`)
 ```python
-s = df.set_index('timestamp')['price']                              # complete hourly grid, NaN kept
+# complete hourly grid, NaN kept
+s = df.set_index('timestamp')['price']
 r = pd.Series(acf(s, nlags=200, missing='conservative'))
 print(r.loc[[1, 24, 48, 168]].round(3))
 ```
 
 ### S13. Final fit and submission (when there is a hidden test set to predict)
 ```python
-def final_submission(train_df, test_df, features, make_model, target, id_cols, path='submission.csv'):
-    """Refit the CHOSEN model on all labelled data, predict EVERY test row, check, save."""
-    rows = train_df.dropna(subset=[target])                      # keep rows with missing features: the pipeline handles them
-    model = make_model().fit(rows[features], rows[target])
-    sub = test_df[id_cols].copy()
-    sub['prediction'] = model.predict(test_df[features])
-    assert len(sub) == len(test_df), 'lost test rows'
-    assert sub['prediction'].notna().all(), 'missing predictions'
-    assert not sub.duplicated(id_cols).any(), 'duplicate ids'
-    print(pd.DataFrame({'train target': rows[target].describe(), 'test prediction': sub['prediction'].describe()}).round(2))
-    sub.to_csv(path, index=False)
-    return sub
+train = df[df['date'] < '2023-12-01'].dropna(subset=['price'])
+# every test row gets a prediction
+test = df[df['date'] >= '2023-12-01']
 
-sub = final_submission(df[df['date'] < '2023-12-01'], df[df['date'] >= '2023-12-01'],
-                       features, make_lasso, 'price', id_cols=['timestamp'])
+model = make_lasso().fit(train[num + cat], train['price'])
+sub = test[['timestamp']].assign(prediction=model.predict(test[num + cat]))
+assert len(sub) == len(test) and sub['prediction'].notna().all()
+print(pd.DataFrame({'train': train['price'].describe(), 'pred': sub['prediction'].describe()}).round(1))
+sub.to_csv('submission.csv', index=False)
 ```
